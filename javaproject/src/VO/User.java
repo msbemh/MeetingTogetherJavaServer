@@ -1,3 +1,4 @@
+package VO;
 import com.google.gson.annotations.Expose;
 
 import java.io.PrintWriter;
@@ -6,10 +7,13 @@ import java.net.Socket;
 import java.util.UUID;
 
 public class User {
-    private String uuid;
     private String name;
     private String id;
     private String phoneNum;
+
+    public User(){
+        
+    }
 
     public String getId() {
         return id;
@@ -22,19 +26,13 @@ public class User {
     @Expose(serialize = false, deserialize = false)
     private transient PrintWriter writer;
 
-    @Expose(serialize = false, deserialize = false)
-    private transient Socket clientSocket;
+    // @Expose(serialize = false, deserialize = false)
+    // private transient Socket clientSocket;
 
     public User(String name) {
-        this.uuid = UUID.randomUUID().toString();
         this.name = name;
 
-        System.out.println("사용자 " + name + "이(가) 생성 됐습니다.");
-    }
-
-    public User(String uuid, String name) {
-        this.uuid = uuid;
-        this.name = name;
+        //System.out.println("사용자 " + name + "이(가) 생성 됐습니다.");
     }
 
     public String getPhoneNum(){
@@ -53,14 +51,6 @@ public class User {
         this.writer = writer;
     }
 
-    public String getUuid() {
-        return uuid;
-    }
-
-    public void setUuid(String uuid) {
-        this.uuid = uuid;
-    }
-
     public String getName() {
         return name;
     }
@@ -69,12 +59,12 @@ public class User {
         this.name = name;
     }
 
-    public Socket getSocket() {
-        return this.clientSocket;
-    }
+    // public Socket getSocket() {
+    //     return this.clientSocket;
+    // }
 
-    public void setSocket(Socket socket) {
-        this.clientSocket = socket;
-    }
+    // public void setSocket(Socket socket) {
+    //     this.clientSocket = socket;
+    // }
 
 }

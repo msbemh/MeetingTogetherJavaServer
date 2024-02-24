@@ -3,6 +3,8 @@ import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import VO.User;
+
 public class Room {
     private int uuid;
     private String name;
@@ -28,7 +30,7 @@ public class Room {
     }
 
     public void removeUser(User user){
-        this.userList = this.userList.stream().filter(user1 -> !user1.getUuid().equals(user.getUuid())).collect(Collectors.toList());
+        this.userList = this.userList.stream().filter(user1 -> !user1.getId().equals(user.getId())).collect(Collectors.toList());
     }
 
     public String getName() {

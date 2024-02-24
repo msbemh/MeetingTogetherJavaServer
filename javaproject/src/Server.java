@@ -1,18 +1,22 @@
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.io.UnsupportedEncodingException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
-import MessageDTO.MessageType;
-
-import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
-import java.nio.charset.StandardCharsets;
-import java.sql.*;
-import java.time.LocalDateTime;
-import java.util.*;
-import java.util.stream.Collector;
-import java.util.stream.Collectors;
+import VO.ReserveMeeting;
+import VO.User;
 
 public class Server {
 
@@ -22,30 +26,23 @@ public class Server {
     public static List<User> allUserList = new ArrayList<>();
 
     /** 현재 서버에 생성된 Room 리스트를 관리 */
-    public static List<Room> allRoomList = new ArrayList<>();
+    // public static List<Room> allRoomList = new ArrayList<>();
 
     /** 예약 리스트 관리 */
-    public static List<ReserveMeetingDTO> reserveMeetingDTOList = new ArrayList<>();
+    public static List<ReserveMeeting> reserveMeetingList = new ArrayList<>();
 
-    /** 
+    /**
      * 방마다 존재하는 사용자 뼈대 구성
      * 원래는 접속된 방과 유저만 관리 했었지만
-     * 접속 되지 않은 유저의 경우 해당 메시지를 DB에 넣어 놓았다가 
+     * 접속 되지 않은 유저의 경우 해당 메시지를 DB에 넣어 놓았다가
      * 해당 유저가 접속하여 소켓연결이 되면 해당 DB를 조회하고 삭제해서 1번만 보내주도록 한다.
      */
     public static List<Room> allBoneRoomList = new ArrayList<>();
 
-    /** JDBC 설정 */
-    public static String dburl = "jdbc:mysql://34.64.140.200:3306/meeting";
-    public static String dbUser = "root";
-    public static String dbpasswd = "Alshalsh92@";
-
     public static Gson gson;
-    public static Connection conn =null; 			//연결을 맺어낼 객체
-    public static PreparedStatement ps = null;	    //명령을 선언할 객체
-    public static ResultSet rs = null; 			//결과값을 담아낼 객체
 
-    public static Map<String, Queue> queueMap = new HashMap<>(); 			//결과값을 담아낼 객체
+    public static ReserveTimerService reserveTimerService;
+    public static DBService dbService;
 
     public static void main(String[] args) {
 
@@ -53,16 +50,59 @@ public class Server {
         gsonBuilder.registerTypeAdapter(LocalDateTime.class, new LocalDateTimeDeserializer());
         gson = gsonBuilder.create();
 
+        /** DB Service 생성 */
+        dbService = new DBService();
+
+        /** 모든 사용자 조회 */
+        allUserList = dbService.getAllUserList();
+
+        /** 예약된 리스트가 존재하는지 확인 */
+        reserveMeetingList = dbService.getReserveMeetingList();
+        System.out.println("[TEST] reserveMeetingList" + reserveMeetingList);
+
+        /** 미팅 예약 기능을 위한 타이머 동작 */
+        reserveTimerService = new ReserveTimerService();
+
+        reserveTimerService.startTask(new Runnable() {
+            @Override
+            public void run() {
+                while(!reserveTimerService.isShutdown()){
+                    try {
+                        Thread.sleep(1000);
+                        for(int i=0; i<reserveMeetingList.size(); i++){
+                            ReserveMeeting reserveMeeting = reserveMeetingList.get(i);
+                            
+                            // 미팅 알림 시간이거나 지나면 알림 보내주기
+                            if(!reserveMeeting.isNotifyComplete() && 
+                                (LocalDateTime.now().isEqual(reserveMeeting.getStartDateTime()) || LocalDateTime.now().isAfter(reserveMeeting.getStartDateTime()))){
+                                int meetingId = reserveMeeting.getRoomId();
+                                String roomName = reserveMeeting.getRoomName();
+
+                                // 먼저 notify complete true로 설정
+                                reserveMeeting.setIsNotifyComplete(true);
+                                dbService.updateMeetingNotify(meetingId);
+
+                                MessageDTO messageDTO = new MessageDTO();
+                                messageDTO.setType(MessageDTO.RequestType.MEETING_RESERVE_NOTIFICATION);
+                                messageDTO.setRoomName(roomName);
+                                messageDTO.setRoomUuid(meetingId);
+                                sendInReserveMeeting(messageDTO, meetingId);
+                            }
+                        }
+                    }catch (Exception e){
+                        System.out.println("예약 타이머 동작중 에러가 발생했습니다. e - " + e.getMessage());
+                    }
+                }
+            }
+        });
+
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
             System.out.println("채팅 서버 동작중 (포트: " + PORT + " )");
 
-            //드라이버 로딩
-            Class.forName("com.mysql.cj.jdbc.Driver");
+            // 처음 뼈대를 위한 모든 방 리스트를 조회한다.
+            allBoneRoomList = dbService.getRoomList();
 
-            conn = DriverManager.getConnection(dburl, dbUser, dbpasswd);
-
-             // 처음 뼈대를 위한 모든 방 리스트를 조회한다.
-            allBoneRoomList = getRoomList();
+            displayServerUserAndRoomList();
 
             /**
              * 각각의 클라이언트마다 새로운 Thread에서 소켓 통신을 할 수 있도록 한다.
@@ -101,41 +141,61 @@ public class Server {
                 MessageDTO.RequestType type = receiveMsgDTO.getType();
 
                 /**
-                 * 서버에서 사용자 추가
-                 * 사용자 리스트에만 추가를 해준다.
+                 * 처음 소켓이 연결 되면 이곳으로 오게 된다.
                  */
                 if(type == MessageDTO.RequestType.USER_ADD){
 
                     // 이미 사용자가 존재한다면 패스
-                    User existUser = findUser(receiveMsgDTO.getUser().getId());
-                    if(existUser != null){
-                        System.out.println("이미 존재 하므로 정리하자.");
-                        exit(existUser);
+                    // User existUser = findUser(receiveMsgDTO.getUser().getId());
+                    // if(existUser != null){
+                    //     System.out.println("이미 존재 하므로 정리하자.");
+                    //     exit(existUser);
+                    // }
+
+                    User user = findUser(receiveMsgDTO.getUser().getId());
+                    if(user == null){
+                        user = new User();
+                        user.setId(receiveMsgDTO.getUser().getId());
+                        user.setName(receiveMsgDTO.getUser().getName());
+                        user.setPhoneNum(receiveMsgDTO.getUser().getPhoneNum());
+                        allUserList.add(user);
                     }
+                    user.setWriter(writer);
+                    me = user;
 
-                    me = receiveMsgDTO.getUser();
-                    me.setWriter(writer);
+                    //me.setWriter(writer);
 
-                    allUserList.add(me);
+                    //allUserList.add(me);
 
                     /**
-                     * 내가 가진 모든 방 리스트를 불러오고
-                     * 방이 없다면 메모리에 추가하고
-                     * 해당 되는 모든 방에 현재 유저를 집어 넣는다.
+                     * 소켓 연결된 사용자가 가진 모든 방을 찾는다.
+                     * 채팅방에 있는 List<User> 의 Writer를 넣어준다.
                      */
-                    List<Integer> myRoomList = getMyRoomList(me);
-                    for(Integer roomId : myRoomList){
-                        Room myRoom = findRoom(roomId);
-                        Room myBoneRoom = findBoneRoom(roomId);
+                    // List<Integer> myRoomList = dbService.getMyRoomList(me);
+                    // for(Integer roomId : myRoomList){
+                    //     // Room myRoom = findRoom(roomId);
+                    //     Room myBoneRoom = findBoneRoom(roomId);
 
-                        if(myRoom == null){
-                            myRoom = new Room(roomId);
-                            allRoomList.add(myRoom);
-                        }
-                        
-                        myRoom.addUser(me);
-                        myBoneRoom.updateWriter(me);
-                    }
+                    //     // if(myBoneRoom == null){
+                    //     //     // myRoom = new Room(roomId);
+                    //     //     Room newBoneRoom = new Room(roomId);
+                    //     //     //allRoomList.add(newBoneRoom);
+                    //     //     allBoneRoomList.add(newBoneRoom);
+                    //     // }
+
+                    //     // myRoom.addUser(me);
+                    //     myBoneRoom.updateWriter(me);
+                    // }
+
+                    /**
+                     * 소켓 연결된 사용자가 가진 모든 예약된 회의방을 찾늗다.
+                     * 예약된 회의방에 있는 List<User> 의 Writer를 넣어준다.
+                     */
+                    // List<Integer> myReserveMeetingList = dbService.getMyRoomList(me);
+                    // for(Integer meetingId : myReserveMeetingList){
+                    //     ReserveMeeting reserveMeeting = findReserveMeeting(meetingId);
+                    //     reserveMeeting.updateWriter(me);
+                    // }
 
                     MessageDTO sendMsgDTO = new MessageDTO();
                     sendMsgDTO.setUser(me);
@@ -147,7 +207,8 @@ public class Server {
                 }else if(type == MessageDTO.RequestType.ROOM_LIST){
                     MessageDTO sendMsgDTO = new MessageDTO();
                     sendMsgDTO.setType(MessageDTO.RequestType.ROOM_LIST);
-                    sendMsgDTO.setRoomList(allRoomList);
+                    //sendMsgDTO.setRoomList(allRoomList);
+                    sendMsgDTO.setRoomList(allBoneRoomList);
                     send(sendMsgDTO, writer);
 
                 // 사용자 리스트
@@ -174,20 +235,35 @@ public class Server {
                      */
                     if(roomType.equals(MessageDTO.RoomType.INDIVIDUAL)){
                         // 상대방과 나와의 방이 존재하는지 확인
-                        if(roomUuid == -1 && !isExistRoom(me, receiverUserId)){
+                        if(roomUuid == -1 && !dbService.isExistRoom(me, receiverUserId)){
                             // 방이 없으면, 방을 생성하고, 매핑 데이터(2개) 추가
                             // 메모리에 방과 방안에 나를 넣어서 메모리에 추가
                             // 친구들은 socket에 연결되면 그때 DB를 조회하여, 매핑 데이터를 읽어오고
                             // 매핑된 데이터를 기반으로 방과 방에 자신을 넣어서 메모리에 삽입한다.
                             // 그럼 나중에 메시지를 보내면 메모리에 있는 녀석들은 즉각 받을 수 있겠지
-                            roomUuid = createIndividualRoom(me, receiverUserId);
+
+                            String roomName = UUID.randomUUID().toString();
+                            roomUuid = dbService.createIndividualRoom(me, receiverUserId, roomName);
+
+                            // 서버 메모리에도 참가했다라는 내용 적용
+                            Room createdRoom = new Room(roomUuid, roomName);
+                            createdRoom.addUser(me);
+
+                            // 상대방도 존재한다면 넣어주자
+                            User anotherUser = findUser(receiverUserId);
+                            if(anotherUser != null) room.addUser(anotherUser);
+
+                            //allRoomList.add(room);
+                            allBoneRoomList.add(room);
+
                             // 방 생성 완료료 표시
                             sendMsgDTO.setResponseType(MessageDTO.ResponseType.ROOM_CREATE_SUCCESS);
                         }
                     }else if(roomType.equals(MessageDTO.RoomType.GROUP)){
                         // 해당 그룹 채팅방이 메모리에 존재하는지 확인
                         int roomId = roomUuid;
-                        boolean isExist = allRoomList.stream().anyMatch(r -> r.getUuid() == roomId);
+                        //boolean isExist = allRoomList.stream().anyMatch(r -> r.getUuid() == roomId);
+                        boolean isExist = allBoneRoomList.stream().anyMatch(r -> r.getUuid() == roomId);
 
                         Room groupRoom = null;
                         if(!isExist){
@@ -200,12 +276,13 @@ public class Server {
                             String[] receiverUserIds = receiverUserId.split(";");
                             for(String receiverUserIdStr : receiverUserIds){
                                 // 상대방이 메모리에 존재한다면 넣어주자
-                                 User anotherUser = findUser(receiverUserIdStr);
-                                 if(anotherUser != null) groupRoom.addUser(anotherUser);
+                                User anotherUser = findUser(receiverUserIdStr);
+                                if(anotherUser != null) groupRoom.addUser(anotherUser);
                             }
 
                             // 생성될 때, 해당 방에 속하는 녀석들은 모두 넣어준다.
-                            allRoomList.add(groupRoom);
+                            //allRoomList.add(groupRoom);
+                            allBoneRoomList.add(groupRoom);
                         }
                     }
 
@@ -213,9 +290,9 @@ public class Server {
                     // 이미지는 PHP 에서 이미 저장하고 온거다
                     int messageId = receiveMsgDTO.getId();
                     if(type == MessageDTO.RequestType.MESSAGE){
-                        messageId = saveMsg(roomUuid, me, message, type.name());
+                        messageId = dbService.saveMsg(roomUuid, me, message, type.name());
                     }
-                    
+
                     // 메시지 정보 조회
 
 
@@ -227,7 +304,7 @@ public class Server {
                     sendMsgDTO.setRoomUuid(roomUuid);
                     sendMsgDTO.setSenderId(me.getId());
                     // 읽지 않은 메시지 가져오기
-                    sendMsgDTO = getMessageDTONoReadCnt(sendMsgDTO);
+                    sendMsgDTO = dbService.getMessageDTONoReadCnt(sendMsgDTO);
 
                     sendInRoom(sendMsgDTO, roomUuid, me);
 
@@ -236,7 +313,7 @@ public class Server {
                 }else if(type == MessageDTO.RequestType.OTHER_USER_MSG_RENEW){
                     int roomUuid = receiveMsgDTO.getRoomUuid();
                     sendInRoomExceptionMe(receiveMsgDTO, roomUuid, me);
-            
+
                 // 방에 입장
                 }else if(type == MessageDTO.RequestType.ROOM_ENTER){
                     int roomUuid = receiveMsgDTO.getRoomUuid();
@@ -252,7 +329,7 @@ public class Server {
                     }
 
                     // 이미 방에 있을 경우
-                    if(isInRoom(me.getUuid())){
+                    if(isInRoom(me.getId())){
                         MessageDTO sendMsgDTO = new MessageDTO();
                         sendMsgDTO.setType(MessageDTO.RequestType.ROOM_ENTER);
                         // sendMsgDTO.setStatus(MessageDTO.Status.ALREADY_IN_ROOM);
@@ -294,25 +371,14 @@ public class Server {
                     sendInRoom(sendMsgDTO, roomUuid);
 
                     displayServerUserAndRoomList();
-                // 방 생성
-                }else if(type == MessageDTO.RequestType.ROOM_CREATE){
-                    // String roomName = receiveMsgDTO.getRoomName();
-
-                    // // 방 생성
-                    // room = new Room(roomName);
-                    // allRoomList.add(room);
-
-                    // // 방에 입장
-                    // room.getUserList().add(me);
-
-                    // MessageDTO sendMsgDTO = new MessageDTO();
-                    // sendMsgDTO.setType(MessageDTO.RequestType.ROOM_CREATE);
-                    // sendMsgDTO.setStatus(MessageDTO.Status.SUCCESS);
-                    // sendMsgDTO.setRoom(room);
-                    // send(sendMsgDTO, writer);
-
-                    // displayServerUserAndRoomList();
-                // 프로그램 종료
+                
+                // 회의방이 생성이 완료 됐다고 알림을 받아서 메모리 관리를 해준다.
+                // 회의방은 PHP에서 생성하였다.
+                }else if(type == MessageDTO.RequestType.NOTIFY_MEETING_RESERVE_CREATED || type == MessageDTO.RequestType.NOTIFY_MEETING_RESERVE_DELETED){
+                    /** 예약된 리스트가 존재하는지 확인 */
+                    reserveMeetingList = dbService.getReserveMeetingList();
+                    System.out.println("[TEST] 새로운 예약 회의방 생성/삭제로 인한 메모리 리프레쉬 reserveMeetingList" + reserveMeetingList);
+                    displayServerUserAndRoomList();
                 }else if(type == MessageDTO.RequestType.EXIT){
                     // int roomUuid = receiveMsgDTO.getRoomUuid();
                     // room = findRoom(roomUuid);
@@ -349,7 +415,7 @@ public class Server {
 //                // 다른 IOException에 대한 예외 처리
 //                e.printStackTrace();
 //            }
-        // 소켓이 닫혔을 때 여기에 추가로 정리 작업을 수행할 수 있음
+            // 소켓이 닫혔을 때 여기에 추가로 정리 작업을 수행할 수 있음
         } finally {
             System.out.println("이곳에서 나머지 메로리 정리를 하자");
             exit(me);
@@ -360,83 +426,143 @@ public class Server {
 
     private static void exit(User user){
         if(user == null) return;
-        if(allUserList != null){
-            // 사용자 제거
-            allUserList = allUserList.stream().filter(pUser -> !pUser.getId().equals(user.getId())).collect(Collectors.toList());
+        // if(allUserList != null){
+        //     // 사용자 제거
+        //     allUserList = allUserList.stream().filter(pUser -> !pUser.getId().equals(user.getId())).collect(Collectors.toList());
+        //     // allUserList.remove(user);
+        // }
+
+        if(allUserList != null){         
+            allUserList.forEach(pUser -> {
+                if(user.getId().equals(pUser.getId())){
+                    pUser.setWriter(null);
+                }
+                
+                //room.setUserList(filteredRoomUserList);
+            });
+
             // allUserList.remove(user);
         }
 
-        if(allRoomList != null){
-            // 모든 방을 뒤져서 사용자 제거
-            allRoomList.forEach(room -> {
-                List<User> filteredRoomUserList = room.getUserList().stream().filter(fUser -> {
-                    if(fUser.getId().equals(user.getId())) return false;
-                    return true;
-                }).collect(Collectors.toList());
+        // if(allRoomList != null){
+        //     // 모든 방을 뒤져서 사용자 제거
+        //     allRoomList.forEach(room -> {
+        //         List<User> filteredRoomUserList = room.getUserList().stream().filter(fUser -> {
+        //             if(fUser.getId().equals(user.getId())) return false;
+        //             return true;
+        //         }).collect(Collectors.toList());
 
-                room.setUserList(filteredRoomUserList);
-            });
+        //         room.setUserList(filteredRoomUserList);
+        //     });
 
-            // 방에 아무도 없으면 삭제
-            allRoomList = allRoomList.stream().filter(room -> room.getUserList().size() > 0).collect(Collectors.toList());
-        }     
-        
-        if(allBoneRoomList != null){
-            // 모든 방을 뒤져서 writer 제거
-            allBoneRoomList.forEach(room -> {
-                List<User> filteredRoomUserList = room.getUserList();
-                for(User fUser : filteredRoomUserList){
-                    if(user.getId().equals(fUser.getId())){
-                        fUser.setWriter(null);
-                    }
-                }
-            });
-        }    
-        System.out.println("메모리 정리 완료");  
+        //     // 방에 아무도 없으면 삭제
+        //     allRoomList = allRoomList.stream().filter(room -> room.getUserList().size() > 0).collect(Collectors.toList());
+        // }
+
+        // if(allBoneRoomList != null){
+        //     // 모든 방을 뒤져서 사용자의 writer 제거
+        //     allBoneRoomList.forEach(room -> {
+        //         for(User pUser : room.getUserList()){
+        //             if(pUser.getId().equals(user.getId())){
+        //                 pUser.setWriter(null);
+        //             }
+        //         }
+        //         //room.setUserList(filteredRoomUserList);
+        //     });
+
+        //     // 방에 아무도 없으면 삭제
+        //     //allRoomList = allRoomList.stream().filter(room -> room.getUserList().size() > 0).collect(Collectors.toList());
+        // }
+
+        // if(reserveMeetingList != null){
+        //     // 모든 방을 뒤져서 사용자의 writer 제거
+        //     reserveMeetingList.forEach(room -> {
+        //         for(User pUser : room.getUserList()){
+        //             if(pUser.getId().equals(user.getId())){
+        //                 pUser.setWriter(null);
+        //             }
+        //         }
+        //         //room.setUserList(filteredRoomUserList);
+        //     });
+
+        //     // 방에 아무도 없으면 삭제
+        //     //allRoomList = allRoomList.stream().filter(room -> room.getUserList().size() > 0).collect(Collectors.toList());
+        // }
+
+        // if(allBoneRoomList != null){
+        //     // 모든 방을 뒤져서 writer 제거
+        //     allBoneRoomList.forEach(room -> {
+        //         List<User> filteredRoomUserList = room.getUserList();
+        //         for(User fUser : filteredRoomUserList){
+        //             if(user.getId().equals(fUser.getId())){
+        //                 fUser.setWriter(null);
+        //             }
+        //         }
+        //     });
+        // }
+        System.out.println("메모리 정리 완료");
 
     }
 
-   
+
     private static void outRoom(int roomUuid, User user){
-        Room room = allRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
-        if(room != null) room.getUserList().remove(user);
+        //Room room = allRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
+        Room room = allBoneRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
+        if(room != null) {
+            List<User> userList = room.getUserList();
+            for(User pUser : userList){
+                if(pUser.getId().equals(user.getId())){
+                    pUser.setWriter(null);
+                    break;
+                }
+            }
+            //room.getUserList().remove(user);
+        }
         // 해당 방에 인원이 아무도 없으면 자동 삭제
-        if(room != null && room.getUserList().isEmpty()) allRoomList.remove(room);
+        // if(room != null && room.getUserList().isEmpty()) allRoomList.remove(room);
     }
 
-    private static User findUser(String uuid){
+    public static User findUser(String uuid){
         if(allUserList == null) return null;
         return allUserList.stream().filter(user -> user.getId().equals(uuid)).findAny().orElse(null);
     }
 
     private static boolean isInRoom(String userUuid){
-        boolean isInRoom =  allRoomList.stream()
-                .flatMap(room -> room.getUserList().stream().map(user -> user.getUuid()))
-                .filter(fUserUuid -> fUserUuid.equals(userUuid)).findAny().isPresent();
+        // boolean isInRoom =  allRoomList.stream()
+        //         .flatMap(room -> room.getUserList().stream().map(user -> user.getUuid()))
+        //         .filter(fUserUuid -> fUserUuid.equals(userUuid)).findAny().isPresent();
+        boolean isInRoom =  allBoneRoomList.stream()
+                .flatMap(room -> room.getUserList().stream().map(user -> user))
+                .filter(fUser -> fUser.getId().equals(userUuid) && fUser.getWriter() != null).findAny().isPresent();
 
         return isInRoom;
     }
 
     private static Room findRoom(int roomUuid){
-        return allRoomList.stream().filter(room -> room.getUuid() == roomUuid).findAny().orElse(null);
+        //return allRoomList.stream().filter(room -> room.getUuid() == roomUuid).findAny().orElse(null);
+        return allBoneRoomList.stream().filter(room -> room.getUuid() == roomUuid).findAny().orElse(null);
     }
 
     private static Room findBoneRoom(int roomUuid){
         return allBoneRoomList.stream().filter(room -> room.getUuid() == roomUuid).findAny().orElse(null);
     }
 
-    private static Room findRoom(User user){
-        for(int i=0; i<allRoomList.size(); i++){
-            Room room = allRoomList.get(i);
-            for(int j=0; j<room.getUserList().size(); j++){
-                User user1 = room.getUserList().get(i);
-                if(user1.getUuid().equals(user.getUuid())){
-                    return room;
-                }
-            }
-        }
-        return null;
+    private static ReserveMeeting findReserveMeeting(int meetingId){
+        return reserveMeetingList.stream().filter(room -> room.getRoomId() == meetingId).findAny().orElse(null);
     }
+
+    // private static Room findRoom(User user){
+    //     for(int i=0; i<allRoomList.size(); i++){
+    //         Room room = allRoomList.get(i);
+    //         for(int j=0; j<room.getUserList().size(); j++){
+    //             User user1 = room.getUserList().get(i);
+    //             if(user1.getUuid().equals(user.getUuid())){
+    //                 return room;
+    //             }
+    //         }
+    //     }
+    //     return null;
+    // }
 
     private static void send(MessageDTO messageDTO, PrintWriter writer){
         String jsonString = gson.toJson(messageDTO);
@@ -444,7 +570,26 @@ public class Server {
     }
 
     private static void sendInRoom(MessageDTO messageDTO, int roomUuid) throws UnsupportedEncodingException {
-       sendInRoom(messageDTO, roomUuid, null);
+        sendInRoom(messageDTO, roomUuid, null);
+    }
+
+    private static void sendInReserveMeeting(MessageDTO messageDTO, int meetingId){
+        ReserveMeeting reserveMeeting = reserveMeetingList.stream().filter(room1 -> room1.getRoomId() == meetingId).findAny().orElse(null);
+
+        if(reserveMeeting != null){
+            List<User> userListInRoom = reserveMeeting.getUserList();
+
+            for(int i=0; i<userListInRoom.size(); i++){
+                User receiveUser = userListInRoom.get(i);
+
+                String jsonString = gson.toJson(messageDTO);
+
+                if(receiveUser.getWriter() != null){
+                    receiveUser.getWriter().println(jsonString);
+                }
+
+            }
+        }
     }
 
     private static void sendInRoom(MessageDTO messageDTO, int roomUuid, User me) throws UnsupportedEncodingException {
@@ -456,7 +601,7 @@ public class Server {
 
             /**
              * 당연히 보낸 사람에게도 메시지가 가서, 전송이 완료 됐다라는 것을 알아야 한다.
-             * 
+             *
              * 개인 톡방인데 상대방의 상태가 OUT이면 상대방이 방에서 나갔다라는 뜻
              */
             messageDTO.setRoomUuid(roomUuid);
@@ -476,27 +621,29 @@ public class Server {
                 // 이곳에 상태가 IN 일 때만 보내주자.
                 if(receiveUser.getWriter() != null){
                     receiveUser.getWriter().println(jsonString);
+                // writer 가 없다면 DB에 메시지 저장
                 }else{
                     MessageDTO.RequestType type = messageDTO.getType();
                     if(type == MessageDTO.RequestType.MESSAGE || type == MessageDTO.RequestType.IMAGE){
                         messageDTO.setReceiverUserId(receiveUser.getId());
-                        saveMessageQueue(messageDTO);
+                        dbService.saveMessageQueue(messageDTO);
                     }
                 }
-                
+
             }
         }
     }
 
     private static void sendInRoomExceptionMe(MessageDTO messageDTO, int roomUuid, User me) throws UnsupportedEncodingException {
-        Room room = allRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
+        //Room room = allRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
+        Room room = allBoneRoomList.stream().filter(room1 -> room1.getUuid() == roomUuid).findAny().orElse(null);
 
         if(room != null){
             List<User> userListInRoom = room.getUserList();
 
             /**
              * 당연히 보낸 사람에게도 메시지가 가서, 전송이 완료 됐다라는 것을 알아야 한다.
-             * 
+             *
              * 개인 톡방인데 상대방의 상태가 OUT이면 상대방이 방에서 나갔다라는 뜻
              */
             messageDTO.setRoomUuid(roomUuid);
@@ -507,7 +654,7 @@ public class Server {
                 if(!me.getId().equals(receiveUser.getId())){
                     String jsonString = gson.toJson(messageDTO);
                     // 이곳에 상태가 IN 일 때만 보내주자.
-                    receiveUser.getWriter().println(jsonString);
+                    if(receiveUser.getWriter() != null) receiveUser.getWriter().println(jsonString);
                 }
             }
         }
@@ -515,435 +662,57 @@ public class Server {
 
     private static void displayServerUserAndRoomList(){
         System.out.println("**********[모든 방 리스트]**********");
-        if(allRoomList.isEmpty()) System.out.println("없음");
-        allRoomList.stream().forEach(room -> {
+        if(allBoneRoomList.isEmpty()) System.out.println("없음");
+        allBoneRoomList.stream().forEach(room -> {
             System.out.println(room.getUuid() + "번방 ");
             System.out.println("(해당 방의 멤버)");
             if(room.getUserList().isEmpty()) System.out.println("없음");
             room.getUserList().stream().forEach(user -> {
-                System.out.println("  - " + user.getName());
+                boolean isConnSocket = user.getWriter() != null;
+                System.out.print("  - " + user.getName());
+                if(isConnSocket){
+                    System.out.print("(소켓연결)");
+                }
+                System.out.println("");
             });
         });
+        // if(allRoomList.isEmpty()) System.out.println("없음");
+        // allRoomList.stream().forEach(room -> {
+        //     System.out.println(room.getUuid() + "번방 ");
+        //     System.out.println("(해당 방의 멤버)");
+        //     if(room.getUserList().isEmpty()) System.out.println("없음");
+        //     room.getUserList().stream().forEach(user -> {
+        //         System.out.println("  - " + user.getName());
+        //     });
+        // });
+
 
         System.out.println("**********[모든 사용자 리스트]**********");
         if(allUserList.isEmpty()) System.out.println("없음");
         allUserList.stream().forEach(user -> {
-            System.out.println(user.getName());
+            boolean isConnSocket = user.getWriter() != null;
+                System.out.print(user.getName());
+                if(isConnSocket){
+                    System.out.print("(소켓연결)");
+                }
+                System.out.println("");
+        });
+
+        System.out.println("**********[예약 회의방 사용자 리스트]**********");
+        if(reserveMeetingList.isEmpty()) System.out.println("없음");
+        reserveMeetingList.stream().forEach(reserveMeeting -> {
+            System.out.println(reserveMeeting.getRoomId() + "번방 ");
+            System.out.println("(해당 방의 멤버)");
+            if(reserveMeeting.getUserList().isEmpty()) System.out.println("없음");
+            reserveMeeting.getUserList().stream().forEach(user -> {
+                boolean isConnSocket = user.getWriter() != null;
+                System.out.print("  - " + user.getName());
+                if(isConnSocket){
+                    System.out.print("(소켓연결)");
+                }
+                System.out.println("");
+            });
         });
     }
-
-    private static int saveMsg(int roomUuid, User me, String msg, String typeName){
-        String sql = "INSERT INTO message(room_id, content, sender, status, type, create_user, create_date, update_user, update_date) " +
-                     "VALUES (?, ?, ?, ?, ?, ?, now(), ?, now())";
-        int messageId = -1;
-        try {
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            ps.setInt(1, roomUuid);
-            ps.setString(2, msg);
-            ps.setString(3, me.getId());
-            ps.setString(4, MessageDTO.Status.SUCCESS.name());
-            ps.setString(5, typeName);
-            ps.setString(6, me.getId());
-            ps.setString(7, me.getId());
-            
-            int result = ps.executeUpdate(); //명렁어 실행
-
-            conn.commit();  // 커밋
-
-            ResultSet generatedKeys = ps.getGeneratedKeys();
-            if(generatedKeys.next()){
-                messageId = generatedKeys.getInt(1);
-            }
-
-            if(result > 0){
-                System.out.println("메시지 저장 성공");
-            }else{
-                System.out.println("실패");
-            }
-
-            return messageId;
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static void saveMessageQueue(MessageDTO messageDTO){
-        String sql = "INSERT INTO message_queue (message_id, receiver)" +
-                     "VALUES (?, ?)";
-        int messageId = messageDTO.getId();
-        String receiver = messageDTO.getReceiverUserId();
-        try {
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            ps.setInt(1, messageId);
-            ps.setString(2, receiver);
-            
-            int result = ps.executeUpdate(); //명렁어 실행
-
-            conn.commit();  // 커밋
-
-            if(result > 0){
-                System.out.println("전달 되지 못한 메시지 저장 성공");
-            }else{
-                System.out.println("전달 되지 못한 메시지 저장 실패");
-            }
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static int createIndividualRoom(User me, String receiveUserId){
-        try {
-            StringBuilder stringBuilder = new StringBuilder();
-            String roomName = UUID.randomUUID().toString();
-            int roomId = -1;
-
-            stringBuilder.append("INSERT INTO room (NAME, type, create_user, create_date, update_user, update_date) ");
-            stringBuilder.append("VALUES (?, ?, ?, now(), ?, now()) ");
-            String sql = stringBuilder.toString();
-
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            ps.setString(1, roomName);
-            ps.setString(2, "INDIVIDUAL");
-            ps.setString(3, me.getId());
-            ps.setString(4, me.getId());
-            int rows = ps.executeUpdate(); //명렁어 실행
-
-            ResultSet generatedKeys = ps.getGeneratedKeys();
-            if(generatedKeys.next()){
-                roomId = generatedKeys.getInt(1);
-
-                // 내가 방에 참여
-                // 나는 이미 방에 참여한 상태이기 때문에 in_date 를 현재 날짜로 한다.
-                stringBuilder.setLength(0);
-                stringBuilder.append("INSERT INTO user_room_map (user_id, room_id, status, in_date)");
-                stringBuilder.append("VALUES (?, ?, ?, now())");
-                sql = stringBuilder.toString();
-
-                ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-
-                ps.setString(1, me.getId());
-                ps.setInt(2, roomId);
-                ps.setString(3, "IN");
-                rows = ps.executeUpdate(); //명렁어 실행
-
-                // 상대방 또한 자동으로 방에 참여
-                stringBuilder.setLength(0);
-                stringBuilder.append("INSERT INTO user_room_map (user_id, room_id, status)");
-                stringBuilder.append("VALUES (?, ?, ?)");
-                sql = stringBuilder.toString();
-
-                ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-
-                ps.setString(1, receiveUserId);
-                ps.setInt(2, roomId);
-                ps.setString(3, "IN");
-                rows = ps.executeUpdate(); //명렁어 실행
-
-                conn.commit();  // 커밋
-
-                // 서버 메모리에도 참가했다라는 내용 적용
-                Room room = new Room(roomId, roomName);
-                room.addUser(me);
-
-                // 상대방도 존재한다면 넣어주자
-                User anotherUser = findUser(receiveUserId);
-                if(anotherUser != null) room.addUser(anotherUser);
-
-                allRoomList.add(room);
-            }
-
-            if(rows > 0){
-                System.out.println("성공");
-            }else{
-                System.out.println("실패");
-            }
-
-            return roomId;
-
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static List<Room> getRoomList(){
-        List<Room> roomList = new ArrayList<>();
-
-        try {
-            StringBuilder stringBuilder = new StringBuilder();
-            stringBuilder.append("SELECT                                    ");
-            stringBuilder.append("    A.id AS room_id,                      ");
-            stringBuilder.append("    A.TYPE AS room_type,                  ");
-            stringBuilder.append("    B.user_id,                            ");
-            stringBuilder.append("    C.name AS user_name                   ");
-            stringBuilder.append("FROM room A                               ");
-            stringBuilder.append("INNER JOIN user_room_map B                ");
-            stringBuilder.append("ON A.id = B.room_id                       ");
-            stringBuilder.append("LEFT OUTER JOIN user C                    ");
-            stringBuilder.append("ON B.user_id = C.user_id                  ");
-            stringBuilder.append("ORDER BY room_id ASC                      ");
-            
-            String sql = stringBuilder.toString();
-
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            rs = ps.executeQuery();
-
-            Integer before_room_id = -1;
-            while (rs.next()) {
-                // 결과 처리
-                Integer room_id = rs.getInt("room_id");
-                String user_id = rs.getString("user_id");
-                String user_name = rs.getString("user_name");
-
-                if(before_room_id != room_id){
-                    before_room_id = room_id;
-                    Room room = new Room(room_id);
-                    roomList.add(room);
-                }
-
-                User user = new User(user_name);
-                user.setId(user_id);
-
-                Room room = roomList.get(roomList.size()-1);
-                room.addUser(user);                
-            }
-
-            return roomList;
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static boolean isExistRoom(User sender, String receiverUserId){
-        
-        try {
-            StringBuilder stringBuilder = new StringBuilder();
-            stringBuilder.append("SELECT                                        ");
-            stringBuilder.append("    COUNT(exist_info.friend_id) AS cnt        ");
-            stringBuilder.append("FROM(                                         ");
-            // stringBuilder.append("    -- 채팅방 목록                             ");
-            // stringBuilder.append("    -- 특정 친구의 룸 매핑 정보                 ");
-            stringBuilder.append("    SELECT                                    ");
-            stringBuilder.append("        A.user_id AS friend_id,               ");
-            stringBuilder.append("        A.room_id                             ");
-            stringBuilder.append("    FROM(                                     ");
-            stringBuilder.append("        SELECT * FROM user_room_map           ");
-            stringBuilder.append("        WHERE user_id = ?                     ");
-            stringBuilder.append("    ) A                                       ");
-            // stringBuilder.append("    -- 내가 포함된 방 번호를 가진 사용자 정보    ");
-            stringBuilder.append("    INNER JOIN (                              ");
-            stringBuilder.append("        SELECT * FROM user_room_map           ");
-            stringBuilder.append("        WHERE user_id = ?                     ");
-            stringBuilder.append("    ) B                                       ");
-            stringBuilder.append("    ON A.room_id = B.room_id                  ");
-            stringBuilder.append(") AS exist_info                               ");
-
-            String sql = stringBuilder.toString();
-
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            ps.setString(1, receiverUserId);
-            ps.setString(2, sender.getId());
-
-            rs = ps.executeQuery();
-
-            rs.next();
-
-            int cnt = rs.getInt("cnt");
-
-            if(cnt > 0){
-                return true;
-            }else{
-                return false;
-            }
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static List<Integer> getMyRoomList(User me){
-        try {
-            StringBuilder stringBuilder = new StringBuilder();
-            stringBuilder.append("SELECT                                    ");
-            stringBuilder.append("    user_id,                              ");
-            stringBuilder.append("    room_id,                              ");
-            stringBuilder.append("    status                                ");
-            stringBuilder.append("FROM user_room_map                        ");
-            stringBuilder.append("WHERE user_id = ?                         ");   
-            String sql = stringBuilder.toString();
-
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            ps.setString(1, me.getId());
-
-            rs = ps.executeQuery();
-
-            List<Integer> myRoomList = new ArrayList<>();
-            while (rs.next()) {
-                // 결과 처리
-                Integer room_id = rs.getInt("room_id");
-                myRoomList.add(room_id);
-            }
-
-            return myRoomList;
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static MessageDTO getMessageDTONoReadCnt(MessageDTO messageDTO){
-
-        try {
-            conn.commit();
-            
-            StringBuilder stringBuilder = new StringBuilder();
-
-            stringBuilder.append("SELECT                                                                                    ");
-            stringBuilder.append("    message_info.id,                                                                      ");
-            stringBuilder.append("    message_info.room_id,                                                                 ");
-            stringBuilder.append("    message_info.content,                                                                 ");
-            stringBuilder.append("    message_info.sender,                                                                  ");
-            stringBuilder.append("    message_info.create_date,                                                             ");
-            stringBuilder.append("    profile.recent_profile_img_path AS profile_img_path,                           ");
-            stringBuilder.append("    COUNT(                                                                                ");
-            stringBuilder.append("        CASE                                                                              ");
-            stringBuilder.append("            WHEN basic = 'in_date' THEN null                                              ");
-            stringBuilder.append("            WHEN basic = 'out_date' THEN                                                  ");
-            stringBuilder.append("                CASE                                                                      ");
-            stringBuilder.append("                    WHEN read_info.basic_date IS NULL THEN 1                              ");
-            stringBuilder.append("                    WHEN message_info.create_date > read_info.basic_date THEN 1           ");
-            stringBuilder.append("                    ELSE null                                                             ");
-            stringBuilder.append("                END                                                                       ");
-            stringBuilder.append("        END ) AS no_read_cnt                                                              ");
-            stringBuilder.append("FROM message AS message_info                                                              ");
-            stringBuilder.append("LEFT OUTER JOIN (                                                                         ");
-            stringBuilder.append("    SELECT                                                                                ");
-            stringBuilder.append("        user_id,                                                                          ");
-            stringBuilder.append("        room_id,                                                                          ");
-            stringBuilder.append("        CASE                                                                              ");
-            stringBuilder.append("            WHEN out_date > in_date THEN 'out_date'                                       ");
-            stringBuilder.append("            WHEN out_date <= in_date THEN 'in_date'                                       ");
-            stringBuilder.append("            WHEN in_date IS NULL THEN 'out_date'                                          ");
-            stringBuilder.append("            WHEN out_date IS NULL THEN 'in_date'                                          ");
-            stringBuilder.append("        END AS basic,                                                                     ");
-            stringBuilder.append("        CASE                                                                              ");
-            stringBuilder.append("            WHEN out_date > in_date THEN out_date                                         ");
-            stringBuilder.append("            ELSE in_date                                                                  ");
-            stringBuilder.append("        END AS basic_date                                                                 ");
-            stringBuilder.append("    FROM user_room_map                                                                    ");
-            stringBuilder.append("    WHERE room_id = ?                                                                     ");
-            stringBuilder.append(") as read_info                                                                            ");
-            stringBuilder.append("ON read_info.room_id = message_info.room_id                                               ");
-            // stringBuilder.append("-- 사용자 프로필 가져오기                                                                   ");
-            stringBuilder.append("LEFT OUTER JOIN (                                                                         ");
-            stringBuilder.append("  SELECT                                                                                    ");
-            stringBuilder.append("    user_id,                                                                              ");
-            stringBuilder.append("    max(profile_img_path) AS recent_profile_img_path                                      ");
-            stringBuilder.append("  FROM user_profile_map A                                                                   ");
-            stringBuilder.append("  WHERE TYPE = 'PROFILE_IMAGE'                                                              ");
-            stringBuilder.append("  GROUP BY user_id                                                                          ");
-            stringBuilder.append(") AS profile                                                                              ");
-            stringBuilder.append("ON profile.user_id = message_info.sender                                                  ");
-            stringBuilder.append("WHERE message_info.room_id = ?                                                            ");
-            stringBuilder.append("AND message_info.id = ?                                                                   ");
-            stringBuilder.append("GROUP BY message_info.id                                                                  ");
-            stringBuilder.append("ORDER BY create_date DESC                                                                 ");
-
-            String sql = stringBuilder.toString();
-
-            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            //conn.setAutoCommit(false);  // 트랜 잭션 시작
-
-            int roomId = messageDTO.getRoomUuid();
-            int messageId = messageDTO.getId();
-
-            ps.setInt(1, roomId);
-            ps.setInt(2, roomId);
-            ps.setInt(3, messageId);
-
-            rs = ps.executeQuery();
-
-            while (rs.next()) {
-                int noReadCnt = rs.getInt("no_read_cnt");
-                // 날짜 값을 가져오기
-                Timestamp timestamp = rs.getTimestamp("create_date");
-                String profileImgPath = rs.getString("profile_img_path");
-                
-                // java.sql.Timestamp를 java.time.LocalDateTime으로 변환
-                LocalDateTime createDate = timestamp.toLocalDateTime();
-                messageDTO.setNoReadCnt(noReadCnt);
-                messageDTO.setCreateDate(createDate);
-                messageDTO.setProfileImgPath(profileImgPath);
-            }
-
-            return messageDTO;
-        } catch (SQLException e) {
-            // 롤백
-            if (conn != null) { 
-                try { 
-                    conn.rollback(); 
-                } catch(SQLException ex) {
-                    ex.printStackTrace();
-                } 
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
 
 }
